@@ -86,55 +86,74 @@ class NPullBandit(MDP):
         else:
             return [0]
 
+        
+def random_transition_func(n_actions, spread, prng=np.random):
+    base = np.eye(spread)
+    rows_to_keep = prng.choice(spread, n_actions, replace=False)
+    no_noise = base[rows_to_keep,:]
+    matrix = no_noise + np.abs( 0.1*prng.randn(n_actions, spread) )
+    matrix = matrix / np.sum(matrix, axis=1, keepdims=True)
+    return matrix
+
 class TreatmentPlan(MDP):
     def __init__(self, param=0):
+        self.N_states = 20
+        self.N_actions = 3
+        self.N_param_settings = 4
+        self.spread = 7 # actions take you at most +- spread/2 away from the current state
+        self.init_state = 3
+        
+        self.spread_vec = np.arange(self.spread) - self.spread // 2
+        
         self.param = param
-        self.allergies = np.array( [[1,0,0],
-                                    [0,1,0],
-                                    [0,0,1],
-                                    [0,0,0]] )
-        self.drug_transitions = np.array([ [[0.0, 0.4, 0.6],
-                                            [0.0, 0.5, 0.5],
-                                            [0.0, 0.8, 0.2]],
-                                           [[0.5, 0.5, 0.0],
-                                            [0.4, 0.2, 0.4],
-                                            [0.2, 0.8, 0.0]] ])
-        self.gamma = 1.0
+        self.terminal_set = { -1, 0, self.N_states - 1 }
+        
+        # self.terminal_set = { -1, 6 }
+        # each 2d array corresponds to a given parameter setting
+        # each columnn corresponds to moving [-2, -1, 0, 1, 2]
+        # each row corresponds to probs under every action
+        prng = np.random.RandomState(43) # seed this so all instantiations of this experiment have the same transition probs per param
+        self.transition_probs = np.array( [random_transition_func(self.N_actions, self.spread, prng) for i in range(self.N_param_settings)] )
+        self.gamma = 0.9
 
+
+    # reset environment and return s0
     def reset(self):
-        return 0
+        return self.init_state
 
     # return a list of states and transition probabilities, as NP arrays
     def transition_func(self, s, a):
-        sp_list = np.maximum( np.minimum(s + np.arange(-1, 1), 4), 0 )
-        sp_dist = self.drug_transitions[self.allergies[self.param, a], a]
-        return sp_list, sp_dist
+        sp = np.array([max(0,min(self.N_states - 1,s+k)) for k in self.spread_vec])
+        return (sp, self.transition_probs[self.param][a])
 
     # return the reward r(s,a,sp)
     def reward_func(self, s, a, sp):
-        rewards = [-1.0, -0.2, -0.2, 0.5]
-        #rewards =  [0, 2.0, 1.5, 1.0, 0.9, 0.5, 0.0]
-        return rewards[sp]
+        reward = sp*1.0/self.N_states # positive proportional to health
+        if sp == 0:
+            reward = -2.0 # cost for dying
+        return reward
 
     # return whether or not the current state is a terminal state
     def done(self, s):
-        return False
+        return s in self.terminal_set
 
     # return a list of all the states of the MDP
+    @property
     def state_space(self):
-        return np.arange(7)
+        return np.arange(self.N_states)
 
     # return a list of all the actions in the MDP
     def action_space(self,s):
-        if s == 0:
-            return np.arange(4)
-        else:
-            return [0]
+        return np.arange(self.N_actions)
+
+    def render(self, s):
+        string = "X" + "-"*(self.N_states-2) + "G"
+        print(string[:s] + "*" + string[s+1:])
 
 class LavaGoalOneD(MDP):
     def __init__(self, param=0):
         self.param = param
-        self.terminal_set = { -1,0, 6 }
+        self.terminal_set = { -1, 0, 20 }
         # self.terminal_set = { -1, 6 }
         # each 2d array corresponds to a given parameter setting
         # each columnn corresponds to moving [-2, -1, 0, 1, 2]
@@ -191,7 +210,7 @@ class LavaGoalOneD(MDP):
     def render(self, s):
         string = "X-----G"
         print(string[:s] + "*" + string[s+1:])
-
+        
 class Inventory(MDP):
     def __init__(self, param=0):
         self.K = 4 # fixed cost of ordering

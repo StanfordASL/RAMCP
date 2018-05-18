@@ -42,32 +42,78 @@ def pkl_to_df(filename):
     df = pd.concat([pd.DataFrame(create_row(entry)) for entry in data], ignore_index=True)
     return df
 
+def plot_spreads(df, df_rmcp=None, filename=None):
+    belief = df['agent.belief'].iloc[0]
+    df = df.set_index(['agent.kwargs.alpha', 'mdp.param'])
+    df = df['reward']
+    mean_rewards = df.groupby(['agent.kwargs.alpha', 'mdp.param']).mean() # mean in each parameter setting
+    var_rewards = df.groupby(['agent.kwargs.alpha', 'mdp.param']).var() # var in each parameter setting
+    mean_vec = mean_rewards.groupby(['agent.kwargs.alpha']).apply(np.array) # combine paramter settings into vector
+    cov_rewards = var_rewards.groupby(['agent.kwargs.alpha']).apply(np.diag) # combine into covar 
+    
+    alphas = mean_vec.index.values
+    means = mean_vec.apply(lambda x: np.dot(x, belief))
+    stds = mean_vec.apply(lambda x: np.cov(x, aweights=belief)).apply(np.sqrt)
+    
+    if df_rmcp is not None:
+        df = df_rmcp.set_index(['agent.kwargs.alpha', 'mdp.param'])
+        df = df['reward']
+        mean_rewards = df.groupby(['agent.kwargs.alpha', 'mdp.param']).mean() # mean in each parameter setting
+        var_rewards = df.groupby(['agent.kwargs.alpha', 'mdp.param']).var() # var in each parameter setting
+        mean_vec = mean_rewards.groupby(['agent.kwargs.alpha']).apply(np.array) # combine paramter settings into vector
+        cov_rewards = var_rewards.groupby(['agent.kwargs.alpha']).apply(np.diag) # combine into covar 
+
+        alphas_rmcp = mean_vec.index.values
+        means_rmcp = mean_vec.apply(lambda x: np.dot(x, belief))
+        stds_rmcp = mean_vec.apply(lambda x: np.cov(x, aweights=belief)).apply(np.sqrt)
+    
+    plt.figure(num=None, figsize=(8,6), dpi=80, facecolor='w', edgecolor='k')
+    plt.tick_params(axis='both', which='major', labelsize=14)
+    plt.errorbar(alphas[::2], means.values[::2], yerr=1.96*stds.values[::2], marker='o', elinewidth=3, markersize=8, capthick=2, capsize=5, linestyle='None', label=r"\textbf{RAMCP}")
+    if df_rmcp is not None:
+        plt.errorbar(alphas_rmcp, means_rmcp.values, yerr=1.96*stds_rmcp, marker='o', elinewidth=3, markersize=8, capthick=2, capsize=5, linestyle='None', mfc='white', label=r"RMCP")
+        plt.legend(fontsize=16, loc=3)
+    plt.grid()
+    plt.xlim([0.15, 1.05])
+    plt.ylim([0, 2.5])
+    plt.xlabel(r"CVaR Quantile ($\alpha$)", fontsize=18)
+    plt.ylabel(r"Reward", fontsize=18)
+    
+    plt.text(0.15, -0.28, 'Worst Case', horizontalalignment='left', fontsize=15)
+    plt.text(1.05, -0.28, 'Risk Neutral', horizontalalignment='right', fontsize=15)
+    
+    if filename:
+        plt.savefig(filename)
+    plt.show()
+        
+    
 #Assumes all entires in df have same belief
 def plot_robustness_curve(df, filename=None):
     belief = df['agent.belief'].iloc[0]
-    df = df.set_index(['agent.alpha', 'mdp.param'])
+    df = df.set_index(['agent.kwargs.alpha', 'mdp.param'])
     df = df['reward']
-    N_rollouts = df.groupby(['agent.alpha', 'mdp.param']).count().groupby('agent.alpha').mean()
-    mean_rewards = df.groupby(['agent.alpha', 'mdp.param']).mean() # mean in each parameter setting
-    var_rewards = df.groupby(['agent.alpha', 'mdp.param']).var() # var in each parameter setting
-    mean_vec = mean_rewards.groupby(['agent.alpha']).apply(np.array) # combine paramter settings into vector
-    cov_rewards = var_rewards.groupby(['agent.alpha']).apply(np.diag) # combine into covar matrix
+    N_rollouts = df.groupby(['agent.kwargs.alpha', 'mdp.param']).count().groupby('agent.kwargs.alpha').mean()
+    mean_rewards = df.groupby(['agent.kwargs.alpha', 'mdp.param']).mean() # mean in each parameter setting
+    var_rewards = df.groupby(['agent.kwargs.alpha', 'mdp.param']).var() # var in each parameter setting
+    mean_vec = mean_rewards.groupby(['agent.kwargs.alpha']).apply(np.array) # combine paramter settings into vector
+    cov_rewards = var_rewards.groupby(['agent.kwargs.alpha']).apply(np.diag) # combine into covar matrix
     
     N_perturb_pts = 10
     perturb_amts = np.linspace(0.0,1.0,N_perturb_pts)
     agent_alphas = mean_vec.index.values
     N_alpha = len(agent_alphas)
-    kl_divs = np.zeros([N_alpha,N_perturb_pts])
-    perturbed_perf = np.zeros([N_alpha,N_perturb_pts])
-    perturbed_perf_std = np.zeros([N_alpha,N_perturb_pts])
+    kl_divs = np.zeros([N_alpha,N_perturb_pts+1])
+    perturbed_perf = np.zeros([N_alpha,N_perturb_pts+1])
+    perturbed_perf_std = np.zeros([N_alpha,N_perturb_pts+1])
     
     plt.figure(num=None, figsize=(8,6), dpi=80, facecolor='w', edgecolor='k')
+    plt.tick_params(axis='both', which='major', labelsize=14)
     for i, agent_alpha in enumerate(agent_alphas):
         mean_perf = mean_vec.loc[agent_alpha]
         cov_perf = cov_rewards.loc[agent_alpha]
         N_params = len(mean_perf)
         
-        for j, alpha_perturb in enumerate(perturb_amts):
+        for j, alpha_perturb in enumerate(reversed(perturb_amts)):
             Aeq = np.ones((1,N_params))
             beq = 1
             A1 = alpha_perturb*np.eye(N_params)
@@ -80,10 +126,14 @@ def plot_robustness_curve(df, filename=None):
             kl_divs[i,j] = stats.entropy(res.x, qk=belief)
             perturbed_perf[i,j] = np.dot(res.x, mean_perf)
             perturbed_perf_std[i,j] = np.sqrt( np.dot(res.x, np.dot(cov_perf, res.x.T))/ N_rollouts.loc[agent_alpha] )
-
-        h, = plt.plot(kl_divs[i,:], perturbed_perf[i,:], label=r"$\alpha="+str(agent_alpha)+r"$")
-        plt.fill_between(kl_divs[i,:], perturbed_perf[i,:]+1.645*perturbed_perf_std[i,:], 
-                         perturbed_perf[i,:]-1.645*perturbed_perf_std[i,:], color=h.get_color(), alpha=0.2)
+        
+        kl_divs[i,-1] = max(kl_divs[i,-1], 1.75)
+        perturbed_perf[i,-1] = perturbed_perf[i,-2]
+        perturbed_perf_std[i,-1] = perturbed_perf_std[i,-2]
+        if i %2 == 0: # or i == 3 or i == 6:
+            h, = plt.plot(kl_divs[i,:], perturbed_perf[i,:], label=r"$\alpha="+str(agent_alpha)+r"$")
+            plt.fill_between(kl_divs[i,:], perturbed_perf[i,:]+1.645*perturbed_perf_std[i,:], 
+                             perturbed_perf[i,:]-1.645*perturbed_perf_std[i,:], color=h.get_color(), alpha=0.15, linestyle=':', edgecolor='black', linewidth=2)
         
     plt.legend(fontsize=16, loc=3)
     plt.grid()
