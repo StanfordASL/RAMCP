@@ -5,10 +5,11 @@ from scipy.stats import rv_discrete
 import scipy.linalg as la
 import numpy as np
 from copy import deepcopy
+from anytree import AnyNode, PostOrderIter
 
-class RiskAverseSparseSampler(Agent):
-    def __init__(self, mdps, belief, max_depth=1, alpha=1.0, n_iter=200, K=20, n_burn_in=0, c=10, exp_risk=None):
-        super(RiskAverseSparseSampler, self).__init__()
+class RiskAverseFullSolve(Agent):
+    def __init__(self, mdps, belief, max_depth=1, alpha=1.0, n_iter=200, K=20, n_burn_in=0, exp_risk=None):
+        super(RiskAverseFullSolve, self).__init__()
         self.mdps = deepcopy(mdps) # identical MDPS, with different transition distributions corresponding to the support of the belief
         self.n_mdps = len(mdps)
 
@@ -24,11 +25,8 @@ class RiskAverseSparseSampler(Agent):
 
         # The search tree is really just a dictionary, indexed by tuples (s0,a0,s1,a1,...)
         # items ending in h require a index ending in a state, items with ha require an index ending in an action.
-        self.Wh = {} # total weight of simulations that visited history h
-        self.Vh = {} # estimated value of history h
-        self.Wha = {} # total weight of simulations that visity history h and took action a
-        self.Wha_br = {} # weighted number of times that action a was the best response at history h at iteration k
-        self.Qha = {} # weighted average of the total returns from simulations after history h and action a
+        self.root = None
+        self.path_to_node = {}
         
         self.model_values = np.zeros(self.n_mdps) # avg performance of the agent under each model
 
@@ -36,8 +34,6 @@ class RiskAverseSparseSampler(Agent):
         self.model_counts = self.laplace_smoothing*np.ones(self.n_mdps)
 
         self.max_depth = max_depth # maximum depth of the search tree
-
-        self.c = c # width of sampling at each transition node per model
 
         self.alpha = alpha # CVaR alpha
         self.K = K # number of tree updates and model rollouts per adversarial belief update.
@@ -59,12 +55,11 @@ class RiskAverseSparseSampler(Agent):
         self.N_belief_updates = 1
         self.adversarial_belief = np.array(self.orig_belief)
         
-        self.Wh = {}
-        self.Vh = {}
-        self.Wha = {}
-        self.Qha = {}
+        self.root = None
         self.model_values = np.zeros(self.n_mdps)
         self.model_counts = self.laplace_smoothing*np.ones(self.n_mdps)
+        
+        self.terminal_histories = []
 
     # run the search to choose the best action
     def action(self, s):
@@ -81,7 +76,7 @@ class RiskAverseSparseSampler(Agent):
         # return self.avg_action((s,))
 
     def plan(self, s):
-        self.SparseSampling(s)
+        self.TreeSearch(s)
 
     # observe a transition, update belief over mdps
     def observe(self, s, a, r, sp):
@@ -100,7 +95,7 @@ class RiskAverseSparseSampler(Agent):
         self.adversarial_belief = deepcopy(self.belief)
 
     # build the tree from state s
-    def SparseSampling(self, s):
+    def TreeSearch(self, s):
         # reset tree from previous computation?
         self.adv_brs = []
         self.adv_avg = []
@@ -110,6 +105,8 @@ class RiskAverseSparseSampler(Agent):
         self.model_value_history = []
 
         self.reset_tree()
+        
+        self.root = self.create_state_node(None, (s,))
 
         for itr in range(self.n_iter):
             self.epsilon = 0.0
@@ -119,16 +116,19 @@ class RiskAverseSparseSampler(Agent):
                     np.random.set_state(rng_state)
                     
                     w = self.adversarial_belief[mdp_i]*self.n_mdps
-                    V_est, V_br_eps = self.estimateV( (s,), mdp_i, 0, self.c, w=w ) 
-
+                    
+                    V_br = self.simulate( self.root, mdp_i, w=w) # simulate all h length action choices from (s,)
+                    
                     self.model_counts[mdp_i] += 1
-                    self.model_values[mdp_i] += (V_br_eps - self.model_values[mdp_i])/self.model_counts[mdp_i]
+                    self.model_values[mdp_i] += (V_br - self.model_values[mdp_i])/self.model_counts[mdp_i]
 
+                V_est = self.estimateV( self.root ) # use counts to update value estimates
+ 
             # record current statistics for stats purposes
             self.adv_brs.append(deepcopy(self.adversarial_belief))
             self.adv_avg.append(deepcopy(self.adversarial_belief_avg))
-            qvals = [self.Qha[(s,a)] for a in self.mdps[0].action_space(s)]
-            self.agent_est_value.append(self.Vh[(s,)])
+            qvals = [self.path_to_node[(s,a)].V for a in self.mdps[0].action_space(s)]
+            self.agent_est_value.append(self.root.V)
             self.agent_Q_vals.append(qvals)
             self.adv_est_value.append(np.dot(self.model_values, self.adversarial_belief_avg))
             self.model_value_history.append(deepcopy(self.model_values))
@@ -158,115 +158,125 @@ class RiskAverseSparseSampler(Agent):
         
         self.N_belief_updates += 1
         self.adversarial_belief_avg += (self.adversarial_belief - self.adversarial_belief_avg)/self.N_belief_updates
-
-    # simulate a rollout under mdp_i up to depth, adding a node and updating counts if update_tree=True
-    # takes a mixed strategy when choosing actions in the constructed tree
-    def estimateV(self, h, mdp_i, depth, c, w=1., update_tree=True):
-        if depth >= self.max_depth:
-            return 0,0
-        if self.mdps[mdp_i].done(h[-1]):
-            return 0,0
-
-        if h not in self.Wh:
-            self.Wh[h] = 0
-            self.Vh[h] = 0
-
-        Qha_est, Qha_br_eps = self.estimateQ(h, mdp_i, depth, c, w, update_tree)
-        a_star = self.greedy_action(h)
-        a_eps_greedy = a_star
-        if np.random.rand() < self.epsilon:
-            a_eps_greedy = self.sample_rollout_action(h)
-
-
-        V_est = Qha_est[a_star]
-
-        self.Wh[h] += 1
-        self.Wha_br[h+(a_star,)] += 1
-        self.Vh[h] = self.Vh[h] + (w*V_est - self.Vh[h])*1.0/self.Wh[h]
-
-        V_br_eps = Qha_br_eps[a_eps_greedy]
-        return V_est, V_br_eps
-
-    def estimateQ(self, h, mdp_i, depth, c, w=1, update_tree=True):
-        Qha_est = np.zeros(len(self.mdps[mdp_i].action_space(h[-1])))
-        Qha_br_eps = np.zeros(len(self.mdps[mdp_i].action_space(h[-1])))
-
-        for i,a in enumerate( self.mdps[mdp_i].action_space(h[-1]) ):
-            if h + (a,) not in self.Wha:
-                self.Wha[h+(a,)] = 0
-                self.Wha_br[h+(a,)] = 0
-                self.Qha[h+(a,)] = 0
-
-            Qha_est[i] = 0
-            Qha_br_eps[i] = 0
-            for j in range(c):
-                r, sp = self.mdps[mdp_i].step(h[-1], a)
-                if self.exp_risk:
-                    r = np.exp(-self.exp_risk*r)
-                V_est, V_br_eps = self.estimateV(h + (a,sp), mdp_i, depth + 1,  self.c, w=w)
-                Qha_est[i] += r + self.gamma*V_est
-                Qha_br_eps[i] += r + self.gamma*V_br_eps
-
-            Qha_est[i] = Qha_est[i]*1.0/c
-            Qha_br_eps[i] = Qha_br_eps[i]*1.0/c
-
-            self.Wha[h+(a,)] += 1
-            self.Qha[h+(a,)] = self.Qha[h+(a,)] + (w*Qha_est[i] - self.Qha[h+(a,)])*1./self.Wha[h+(a,)]
-
-        return Qha_est, Qha_br_eps
-
-    def random_action(self, h):
-        # randomly sample action
-        return np.random.choice(self.mdps[0].action_space(h[-1]))
-
-    def eps_greedy_action(self, h, eps):
-        if np.random.rand() < eps:
-            return self.random_action(h)
+        
+    def simulate(self, state_node, mdp_i, w=1.):
+        state_node.N += w
+        
+        if int(state_node.depth / 2) >= self.max_depth:
+            return 0
+        if self.mdps[mdp_i].done(state_node.id[-1]):
+            return 0
+        
+        s = state_node.id[-1]
+        V_br = 0
+        
+        for action_node in state_node.children:
+            action_node.N += w
+            
+            a = action_node.id[-1]                
+            r, sp = self.mdps[mdp_i].step(s, a)
+            
+            sp_id = action_node.id + (sp,)
+            if sp_id not in self.path_to_node:
+                self.create_state_node(action_node, sp_id)
+           
+            sp_node = self.path_to_node[sp_id]
+            
+            Rp = self.simulate(sp_node, mdp_i, w)
+            if a == self.greedy_action(state_node.id):
+                action_node.N_best += w
+                V_br = r + Rp
+        
+        return V_br
+         
+        
+    def create_state_node(self, parent_action_node, sp_id):
+        # print('Creating state node at', sp_id)
+        state_node = AnyNode(N=0, V=0, id=sp_id, parent=parent_action_node)
+        self.path_to_node[sp_id] = state_node
+        for a in self.mdps[0].action_space(sp_id[-1]):
+            ac_id = sp_id + (a,)
+            ac_node = AnyNode(N=0, N_best=0, V=0, id=ac_id, parent=state_node)
+            self.path_to_node[ac_id] = ac_node
+        
+        return state_node
+    
+    
+    # use counts in tree along with mdps reward function to compute value function
+    def estimateV(self, state_node):
+        # V = max_a Q 
+        if state_node.is_leaf:
+            print('state node is leaf:', state_node)
+            state_node.V = 0
+            return 0
+        
+        Qs = []
+        for ac_node in state_node.children:
+            Qs.append(self.estimateQ(ac_node))
+        
+        V = max(Qs)
+        
+        state_node.V = V
+        
+        return V
+    
+    def estimateQ(self, action_node):
+        if action_node.is_leaf:
+            action_node.V = 0
+            return 0
+        
+        counts = [] # N(s,a,sp)
+        rewards = [] # R(s,a,sp)
+        values = [] # V(sp)
+        for sp_node in action_node.children:
+            rewards.append(self.mdps[0].reward_func(sp_node.id[-3], sp_node.id[-2], sp_node.id[-1]))
+            counts.append(sp_node.N)
+            values.append(self.estimateV(sp_node))
+            
+        counts = np.array(counts)
+        rewards = np.array(rewards)
+        values = np.array(values)
+        
+        N = action_node.N
+        
+        if N == 0:
+            Q = 0
         else:
-            return self.greedy_action(h)
+            Q = 1./N * np.sum(counts*(rewards + values))
+        
+        action_node.V = Q
+        
+        return Q
 
-    def robust_action(self, h):
-        best_a = -1
-        best_val = 0
-        if h not in self.Wh:
-            return self.random_action(h)
+    def random_action(self, s_id):
+        # randomly sample action
+        return np.random.choice(self.mdps[0].action_space(s_id[-1]))
 
-        for a in self.mdps[0].action_space(h[-1]):
-            val = self.Wha_star[h+(a,)]
+    def greedy_action(self, s_id):
+        if s_id not in self.path_to_node:
+            return self.random_action(s_id)
 
-            if val > best_val:
-                best_val = val
-                best_a = a
+        state_node = self.path_to_node[s_id]
+        if state_node.is_leaf:
+            return self.random_action(s_id)
+        
+        action_nodes = state_node.children
+        Qvals = [ac.V for ac in action_nodes]
+        best_a_idx = np.argmax(Qvals)
+        
+        return action_nodes[best_a_idx].id[-1]
 
-        if best_a == -1:
-            best_a = self.random_action(h)
-
-        return best_a
-
-    def greedy_action(self, h):
-        best_a = -1
-        best_val = 0
-        if h not in self.Wh:
-            return self.random_action(h)
-
-        for a in self.mdps[0].action_space(h[-1]):
-            val = self.Qha[h+(a,)]
-
-            if val > best_val:
-                best_val = val
-                best_a = a
-
-        if best_a == -1:
-            best_a = self.random_action(h)
-
-        return best_a
-
-    def avg_action(self, h):
-        actions = self.mdps[0].action_space(h[-1])
-        if h not in self.Wh:
+    def avg_action(self, s_id): 
+        if s_id not in self.path_to_node:
+            actions = self.mdps[0].action_space(s_id[-1])
             probs = np.ones(len(actions))
         else:
-            probs = np.array( [self.Wha_br[h+(a,)]*1. for a in actions] )
+            state_node = self.path_to_node[s_id]
+            action_nodes = state_node.children
+            actions = np.array( [ac.id[-1] for ac in action_nodes ] )
+            probs = np.array( [ac.N_best for ac in action_nodes ] )
+            
         probs = probs/np.sum(probs)
         a = np.random.choice(actions, p=probs)
+        
         return a

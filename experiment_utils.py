@@ -4,6 +4,8 @@ from copy import deepcopy
 from RiskAverseMCTS import RiskAverseMCTS
 from RiskAverseSparseSampler import RiskAverseSparseSampler
 from RiskAverseMarkovAgent import RiskAverseMarkovAgent
+from RiskAverseFullSolve import RiskAverseFullSolve
+
 import multiprocessing
 from tqdm import tqdm
 import pickle
@@ -100,7 +102,50 @@ class BanditExperimentGen(object):
         self.T = 4
         self.N_params = 2
         self.N_alpha = 3
-        self.N_rollouts = 500
+        self.N_rollouts = 1000
+        
+    def __len__(self):
+        return self.N_alpha*self.N_params
+    
+    def __iter__(self):
+        return self.gen()
+    
+    def gen(self):
+        for param in range(self.N_params):
+            for alpha in np.linspace(0.25,1.0,self.N_alpha):
+                agent_param = deepcopy(self.agent_base)
+                mdp_param = deepcopy(self.mdp_base)
+
+                agent_param['kwargs']['alpha'] = alpha
+                mdp_param['param'] = param
+                yield (agent_param, mdp_param, self.T, self.N_rollouts)
+                
+                
+class FullSolveBanditExperimentGen(object):
+    def __init__(self):
+        self.agent_base = {
+            'class': RiskAverseFullSolve,
+            'mdp': NPullBandit,
+            'mdp_params': [0,1],
+            'belief': [0.6, 0.4],
+            'kwargs': {
+                'max_depth': 4,
+                'alpha': 1.0,
+                'n_iter': 1250,
+                'K': 1,
+            },
+            'replan': False,
+        }
+
+        self.mdp_base = {
+            'class': NPullBandit,
+            'param': 0
+        }
+
+        self.T = 4
+        self.N_params = 2
+        self.N_alpha = 3
+        self.N_rollouts = 1000
         
     def __len__(self):
         return self.N_alpha*self.N_params
@@ -118,14 +163,57 @@ class BanditExperimentGen(object):
                 mdp_param['param'] = param
                 yield (agent_param, mdp_param, self.T, self.N_rollouts)
 
+
+class FullSolveTreatmentExperimentGen(object):
+    def __init__(self):
+        self.agent_base = {
+            'class': RiskAverseFullSolve,
+            'mdp': TreatmentPlan,
+            'mdp_params': list(range(15)),
+            'belief': [0.25] + [0.75/14]*14,
+            'kwargs': {
+                'max_depth': 4,
+                'alpha': 1.0,
+                'n_iter': 2500,
+                'K': 1
+            },
+            'replan': False,
+        }
+
+        self.mdp_base = {
+            'class': TreatmentPlan,
+            'param': 0
+        }
+
+        self.T = 4
+        self.N_params = 15
+        self.N_alpha = 3
+        self.N_rollouts = 500
+        
+    def __len__(self):
+        return self.N_alpha*self.N_params*2
+    
+    def __iter__(self):
+        return self.gen()
+    
+    def gen(self):
+        for param in range(self.N_params):
+            for alpha in np.linspace(0.2,1.0,self.N_alpha):
+                agent_param = deepcopy(self.agent_base)
+                mdp_param = deepcopy(self.mdp_base)
+
+                agent_param['kwargs']['alpha'] = alpha
+                mdp_param['param'] = param
+                yield (agent_param, mdp_param, self.T, self.N_rollouts)
+                
                     
 class TreatmentExperimentGen(object):
     def __init__(self):
         self.agent_base = {
             'class': RiskAverseSparseSampler,
             'mdp': TreatmentPlan,
-            'mdp_params': [0,1,2,3],
-            'belief': [0.15, 0.15, 0.15, 0.55],
+            'mdp_params': list(range(15)),
+            'belief': [0.25] + [0.75/14]*14,
             'kwargs': {
                 'max_depth': 4,
                 'alpha': 1.0,
@@ -142,12 +230,12 @@ class TreatmentExperimentGen(object):
         }
 
         self.T = 4
-        self.N_params = 4
-        self.N_alpha = 7
+        self.N_params = 15
+        self.N_alpha = 3
         self.N_rollouts = 500
         
     def __len__(self):
-        return self.N_alpha*self.N_params
+        return self.N_alpha*self.N_params*2
     
     def __iter__(self):
         return self.gen()
@@ -159,6 +247,14 @@ class TreatmentExperimentGen(object):
                 mdp_param = deepcopy(self.mdp_base)
 
                 agent_param['kwargs']['alpha'] = alpha
+                mdp_param['param'] = param
+                yield (agent_param, mdp_param, self.T, self.N_rollouts)
+                
+            for exp_risk in np.linspace(0.1,1.5,self.N_alpha):
+                agent_param = deepcopy(self.agent_base)
+                mdp_param = deepcopy(self.mdp_base)
+
+                agent_param['kwargs']['exp_risk'] = exp_risk
                 mdp_param['param'] = param
                 yield (agent_param, mdp_param, self.T, self.N_rollouts)
                     
